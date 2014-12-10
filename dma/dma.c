@@ -54,15 +54,17 @@ static uint32_t				num_pages;
 
 static uint32_t mem_virt_to_phys(uint32_t* virt, uint32_t* numContiguous)
 {
-   	uint32_t offset = virt - dma_memory;
+   	uint32_t offset = (uint32_t)virt - (uint32_t)dma_memory;
 
 	if (!dma_memory || (virt > (uint32_t *)cb_base || virt < dma_memory))	//cb_base is the last region in the mmap'ed space
 	{
 		PRINT_DMA_MSG( "DMA invalid location %p, offset %d, page %d", virt, offset, (offset >> PAGE_SHIFT));
-		*numContiguous = 0;
+		if (numContiguous) *numContiguous = 0;
 		return 0;
 	}
 	if (numContiguous) *numContiguous = dma_memory_map[offset >> PAGE_SHIFT].numContiguous;
+
+	PRINT_DMA_MSG( "DMA mem_virt_to_phys %p => 0x%X, offset %d, page %d\n", virt, dma_memory_map[offset >> PAGE_SHIFT].physaddr + (offset & ~(PAGE_SIZE-1)), offset, (offset >> PAGE_SHIFT));
 
 	return dma_memory_map[offset >> PAGE_SHIFT].physaddr + (offset & ~(PAGE_SIZE-1));
 }
@@ -102,7 +104,7 @@ static void make_pagemap(void* virtcached)
     int i,j, fd, memfd, pid;
     char pagemap_fn[64];
 
-	PRINT_DMA_MSG("make_pagemap()");
+	PRINT_DMA_MSG("make_pagemap()\n");
 
 	dma_memory_map = malloc(num_pages* sizeof(page_map_t) );
     if (dma_memory_map == 0)
@@ -142,13 +144,13 @@ static void make_pagemap(void* virtcached)
 			}
 		}    
 
-		if ( i<10 || i%1000 == 0 || i == num_pages-1) PRINT_DMA_MSG("DMA %4d, p addr 0x%X, v addr 0x%X",i, dma_memory_map[i].physaddr, dma_memory + i * PAGE_SIZE); 
+		if ( i<10 || i%1000 == 0 || i == num_pages-1) PRINT_DMA_MSG("DMA %4d, p addr 0x%X, v addr 0x%X\n",i, dma_memory_map[i].physaddr, (unsigned char*)dma_memory + i * PAGE_SIZE); 
 
 		if (mmap((unsigned char*)dma_memory + i * PAGE_SIZE, PAGE_SIZE, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_SHARED|MAP_FIXED|MAP_LOCKED|MAP_NORESERVE,
-                memfd, (uint32_t)pfn << PAGE_SHIFT | 0x40000000) != dma_memory + i * PAGE_SIZE) 
+                memfd, (uint32_t)pfn << PAGE_SHIFT | 0x40000000) != (unsigned char*)dma_memory + i * PAGE_SIZE) 
 		{
-			PRINT_DMA_MSG("Failed to create uncached map of page %d at %p\n", i, dma_memory + i * PAGE_SIZE);
-			break;
+			PRINT_DMA_MSG("Failed to create uncached map of page %d at %p\n", i, (unsigned char*)dma_memory + i * PAGE_SIZE);
+			//break;
         }
     }
 
@@ -163,7 +165,7 @@ static void make_pagemap(void* virtcached)
 	}
 #endif
 
-	PRINT_DMA_MSG("Allocated N64 memory"); 
+	//PRINT_DMA_MSG("Allocated DMA memory\n"); 
 }
 
 
@@ -197,6 +199,8 @@ void* dma_malloc(unsigned int size)
 	// Need to get enough space for what is requested + one page to hold the dma control block (cb_base)
 	num_pages = ( (size + (PAGE_SIZE-1)) >> PAGE_SHIFT) + 1;	
 	
+	PRINT_DMA_MSG("Creating %d pages\n", num_pages);
+
 	virtcached = mmap(NULL, num_pages * PAGE_SIZE, PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS|MAP_NORESERVE|MAP_LOCKED, -1, 0);
 
 	if (virtcached == MAP_FAILED){
@@ -206,24 +210,32 @@ void* dma_malloc(unsigned int size)
 
 	if ((unsigned long)virtcached & (PAGE_SIZE-1))
 	{
-			// PRINT_DMA_MSG("virtcached is not page aligned\n");
+			PRINT_DMA_MSG("virtcached is not page aligned\n");
 			virtcached = (char*)(((unsigned long)virtcached & ~(PAGE_SIZE-1)) + PAGE_SIZE);	//align virtcached
-	}            	
+	}   	
 
 	//force linux to allocate
 	memset(virtcached, 0, num_pages * PAGE_SIZE);
 		
-	//now we get 
+
 	dma_memory = mmap(NULL, num_pages * PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS|MAP_NORESERVE|MAP_LOCKED, -1, 0);
 	
+	//setup page mapping and link physical memory to virtual;
 	make_pagemap(virtcached);
-
-	physical_cb_base = mem_virt_to_phys((uint32_t*)cb_base,0);
-	cb_base->NEXTCONBK = 0;
+	
+	//set the cb_base to be the last page
+	cb_base = (dma_cb_t*)((char*)dma_memory + PAGE_SIZE * (num_pages-1));
+	
+	PRINT_DMA_MSG("dma_memory %p, cb_base %p\n",dma_memory,cb_base);
+	
+	// get the physical address we are going to use for DMA Control Blocks
+	physical_cb_base = mem_virt_to_phys((uint32_t*)cb_base, 0);
+	cb_base->NEXTCONBK = 0;		//DMA will stop when its current block is 0 else it will move onto this block 
 
 	//move DMA pointer to desired channel
 	dma_reg += dma_chan * DMA_CHAN_SIZE / sizeof(uint32_t);
 
+	// reset DMA controller
 	dma_reg[DMA_CS] |= DMA_CS_RESET;
 
     usleep(10);
@@ -235,7 +247,7 @@ void* dma_malloc(unsigned int size)
 
 	PRINT_DMA_MSG("Hardware DMA Initialized. CB addr %p, CS 0x%X\n", physical_cb_base, dma_reg[DMA_CS]);
 
-	return 0;
+	return dma_memory;
 }
 
 void dma_copy(void* from, void* to, uint32_t len)
@@ -265,7 +277,7 @@ void dma_copy(void* from, void* to, uint32_t len)
 	}
 	else
 	{
-		PRINT_DMA_MSG("%d dma panic! %p =>%p, length %d. %d %d %d %d", __LINE__, physicalSrc, physicalDest, len, numBoundaryCrossingsSrc, numBoundaryCrossingsDst, numContiguousSrc, numContiguousDst); 
+		PRINT_DMA_MSG("%d dma panic! %p =>%p, length %d. %d %d %d %d\n", __LINE__, physicalSrc, physicalDest, len, numBoundaryCrossingsSrc, numBoundaryCrossingsDst, numContiguousSrc, numContiguousDst); 
 		memcpy(to, from, len);
 	}
 }
@@ -316,4 +328,5 @@ void dma_status(void)
 	printf("Current CB 0x%X, Next CB 0x%X \n", 
 		(dma_reg[DMA_CONBLK_AD]), 
 		(dma_reg[DMA_NEXT]));
+	printf("___________________________________________\n\n");
 }
